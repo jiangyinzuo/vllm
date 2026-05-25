@@ -195,6 +195,7 @@ from typing import ClassVar, Generic, TypeVar, cast
 
 import torch
 import torch.nn as nn
+from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from tqdm import tqdm
 
 import vllm.envs as envs
@@ -535,7 +536,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         output_shape: torch.Size | None = None,
+        kv_cache_dummy_dep: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if kv_cache_dummy_dep is not None:
+            assert not self.calculate_kv_scales, (
+                "Manual MLA RoPE+KV cache fusion cannot be used while dynamic "
+                "KV scale calculation is enabled."
+            )
+
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(
                 q,
@@ -562,14 +570,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             assert isinstance(slot_mapping, dict), (
                 f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
             )
-            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-                kv_c_normed,
-                k_pe,
-                self_kv_cache,
-                slot_mapping.get(self.layer_name),
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+            if kv_cache_dummy_dep is None:
+                self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                    kv_c_normed,
+                    k_pe,
+                    self_kv_cache,
+                    slot_mapping.get(self.layer_name),
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             self.forward_impl(
                 q,
@@ -582,13 +591,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             return output
         else:
             encoded = _encode_layer_name(self.layer_name)
-            kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
-                kv_c_normed,
-                k_pe,
-                encoded,
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+            if kv_cache_dummy_dep is None:
+                kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
+                    kv_c_normed,
+                    k_pe,
+                    encoded,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             torch.ops.vllm.unified_mla_attention_with_output(
                 q,
@@ -599,6 +609,43 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
             return output
+
+    def fused_rope_kv_cache_update(
+        self,
+        positions: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        is_neox_style: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if torch.compiler.is_compiling():
+            at = auto_functionalized(
+                torch.ops.vllm.fused_rope_unified_mla_kv_cache_update.default,
+                positions=positions,
+                q_pe=q_pe,
+                k_pe=k_pe,
+                kv_c=kv_c_normed,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=is_neox_style,
+                kv_cache_dtype=self.kv_cache_dtype,
+                kv_cache_scale=self._k_scale,
+                layer_name=_encode_layer_name(self.layer_name),
+            )
+            dummy, q_pe, k_pe = at
+        else:
+            dummy = torch.ops.vllm.fused_rope_unified_mla_kv_cache_update(
+                positions,
+                q_pe,
+                k_pe,
+                kv_c_normed,
+                cos_sin_cache,
+                is_neox_style,
+                self.kv_cache_dtype,
+                self._k_scale,
+                _encode_layer_name(self.layer_name),
+            )
+        return dummy, q_pe, k_pe.unsqueeze(1)
 
     def forward_impl(
         self,
@@ -1034,6 +1081,57 @@ direct_register_custom_op(
     op_name="unified_mla_kv_cache_update",
     op_func=unified_mla_kv_cache_update,
     fake_impl=unified_mla_kv_cache_update_fake,
+)
+
+
+def fused_rope_unified_mla_kv_cache_update_impl(
+    positions: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_c: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    kv_cache_dtype: str,
+    kv_cache_scale: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    layer_name = _resolve_layer_name(layer_name)
+    _, _, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    if layer_slot_mapping is not None:
+        ops.concat_and_cache_mla_rope_fused(
+            positions,
+            q_pe,
+            k_pe,
+            kv_c,
+            cos_sin_cache,
+            is_neox,
+            layer_slot_mapping,
+            kv_cache,
+            kv_cache_dtype,
+            kv_cache_scale,
+        )
+    return torch.empty(0, device=kv_c.device, dtype=kv_c.dtype)
+
+
+def fused_rope_unified_mla_kv_cache_update_fake(
+    positions: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_c: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    kv_cache_dtype: str,
+    kv_cache_scale: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    return torch.empty(0, dtype=kv_c.dtype, device=kv_c.device)
+
+
+direct_register_custom_op(
+    op_name="fused_rope_unified_mla_kv_cache_update",
+    op_func=fused_rope_unified_mla_kv_cache_update_impl,
+    fake_impl=fused_rope_unified_mla_kv_cache_update_fake,
+    mutates_args=["q_pe", "k_pe"],
 )
 
 

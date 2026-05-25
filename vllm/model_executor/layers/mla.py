@@ -4,10 +4,14 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm.config import CacheConfig
+from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import (
+    DeepseekScalingRotaryEmbedding,
+    RotaryEmbedding,
+)
 
 
 @dataclass
@@ -87,6 +91,10 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.indexer = mla_modules.indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
+        vllm_config = get_current_vllm_config()
+        self.fuse_rope_kvcache_cat_mla = (
+            vllm_config.compilation_config.pass_config.fuse_rope_kvcache_cat_mla
+        )
 
         # Whether to skip top-k token selection computation in this layer.
         # When True, the indexer will not be called, and the layer will reuse
@@ -159,8 +167,34 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
+        kv_cache_dummy_dep = None
 
-        if self.rotary_emb is not None:
+        use_fused_rope_kv_cache_update = (
+            self.fuse_rope_kvcache_cat_mla
+            and not self.mla_attn.calculate_kv_scales
+            and type(self.rotary_emb)
+            in (
+                RotaryEmbedding,
+                DeepseekScalingRotaryEmbedding,
+            )
+        )
+
+        if use_fused_rope_kv_cache_update:
+            q_pe = q[..., self.qk_nope_head_dim :]
+            if getattr(self.rotary_emb, "use_flashinfer", False):
+                cos_sin_cache = self.rotary_emb.cos_sin_cache
+            else:
+                cos_sin_cache = self.rotary_emb._match_cos_sin_cache_dtype(q_pe)
+            kv_cache_dummy_dep, q_pe, k_pe = self.mla_attn.fused_rope_kv_cache_update(
+                positions,
+                q_pe,
+                k_pe.squeeze(1),
+                kv_c_normed,
+                cos_sin_cache,
+                self.rotary_emb.is_neox_style,
+            )
+            q[..., self.qk_nope_head_dim :] = q_pe
+        elif self.rotary_emb is not None:
             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )
@@ -176,6 +210,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             kv_c_normed,
             k_pe,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
+            kv_cache_dummy_dep=kv_cache_dummy_dep,
         )
 
         return self.o_proj(attn_out)[0]

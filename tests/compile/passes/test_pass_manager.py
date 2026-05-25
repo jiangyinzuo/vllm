@@ -5,13 +5,16 @@ import copy
 import pytest
 import torch
 
+from vllm.compilation.passes.fusion.mla_rope_kvcache_cat_fusion import (
+    MLARoPEKVCacheCatFusionPass,
+)
 from vllm.compilation.passes.inductor_pass import (
     CallableInductorPass,
     InductorPass,
     pass_context,
 )
 from vllm.compilation.passes.pass_manager import PostGradPassManager
-from vllm.config import ModelConfig, VllmConfig
+from vllm.config import CompilationConfig, ModelConfig, PassConfig, VllmConfig
 from vllm.config.utils import Range
 
 
@@ -81,3 +84,19 @@ def test_pass_manager_uuid(callable):
         pass_manager3.configure(config2)
         pass_manager3.add(callable)
         assert uuid1 != pass_manager3.uuid()
+
+
+def test_mla_rope_kvcache_cat_is_manual_fusion():
+    config = VllmConfig(
+        model_config=ModelConfig(dtype=torch.bfloat16),
+        compilation_config=CompilationConfig(
+            pass_config=PassConfig(fuse_rope_kvcache_cat_mla=True)
+        ),
+    )
+
+    pass_manager = PostGradPassManager()
+    pass_manager.configure(config)
+
+    assert not any(
+        isinstance(pass_, MLARoPEKVCacheCatFusionPass) for pass_ in pass_manager.passes
+    )

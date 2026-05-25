@@ -3,75 +3,20 @@
 import torch
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 
-import vllm._custom_ops as ops
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import MLAAttention
-from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
     LayerNameType,
     _encode_layer_name,
-    _resolve_layer_name,
-    direct_register_custom_op,
 )
 
 from ..vllm_inductor_pass import VllmFusionPatternMatcherPass, VllmPatternReplacement
 from .matcher_utils import MatcherDeepseekScalingRotaryEmbedding, MatcherRotaryEmbedding
 
 logger = init_logger(__name__)
-
-
-def fused_rope_unified_mla_kv_cache_update_impl(
-    positions: torch.Tensor,
-    q_pe: torch.Tensor,
-    k_pe: torch.Tensor,
-    kv_c: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    is_neox: bool,
-    kv_cache_dtype: str,
-    kv_cache_scale: torch.Tensor,
-    layer_name: LayerNameType,
-) -> torch.Tensor:
-    layer_name = _resolve_layer_name(layer_name)
-    attn_metadata, _, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
-    if layer_slot_mapping is not None:
-        ops.concat_and_cache_mla_rope_fused(
-            positions,
-            q_pe,
-            k_pe,
-            kv_c,
-            cos_sin_cache,
-            is_neox,
-            layer_slot_mapping,
-            kv_cache,
-            kv_cache_dtype,
-            kv_cache_scale,
-        )
-    return torch.empty(0, device=kv_c.device, dtype=kv_c.dtype)
-
-
-def fused_rope_unified_mla_kv_cache_update_fake(
-    positions: torch.Tensor,
-    q_pe: torch.Tensor,
-    k_pe: torch.Tensor,
-    kv_c: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    is_neox: bool,
-    kv_cache_dtype: str,
-    kv_cache_scale: torch.Tensor,
-    layer_name: LayerNameType,
-) -> torch.Tensor:
-    return torch.empty(0, dtype=kv_c.dtype, device=kv_c.device)
-
-
-direct_register_custom_op(
-    op_name="fused_rope_unified_mla_kv_cache_update",
-    op_func=fused_rope_unified_mla_kv_cache_update_impl,
-    fake_impl=fused_rope_unified_mla_kv_cache_update_fake,
-    mutates_args=["q_pe", "k_pe"],
-)
 
 
 class MLARoPEKVCacheCatPattern(VllmPatternReplacement):

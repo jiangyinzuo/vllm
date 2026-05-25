@@ -27,6 +27,7 @@ from vllm.config import (
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding,
     RotaryEmbedding,
@@ -411,3 +412,174 @@ def test_mla_rope_kvcache_cat_fusion(
             atol=ATOL,
             rtol=RTOL,
         )
+
+
+class IdentityModule(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+
+class SplitQKVProjection(torch.nn.Module):
+    def __init__(self, q_lora_rank: int, kv_lora_rank: int, qk_rope_head_dim: int):
+        super().__init__()
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor]:
+        return (
+            hidden_states[
+                :, : self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+            ],
+        )
+
+
+class TupleLinear(torch.nn.Module):
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.linear = torch.nn.Linear(in_features, out_features, bias=False)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor]:
+        return (self.linear(x),)
+
+
+class OutputProjection(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor]:
+        return (x,)
+
+
+class DummyKVProjection(torch.nn.Module):
+    pass
+
+
+def test_mla_wrapper_manual_rope_kvcache_fusion_path(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    dtype = torch.bfloat16
+    torch.set_default_dtype(dtype)
+
+    q_lora_rank = 8
+    kv_lora_rank = 6
+    qk_nope_head_dim = 4
+    qk_rope_head_dim = 4
+    v_head_dim = 4
+    num_heads = 2
+    num_tokens = 3
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(dtype=dtype),
+        cache_config=CacheConfig(block_size=16, cache_dtype="auto"),
+        compilation_config=CompilationConfig(
+            pass_config=PassConfig(fuse_rope_kvcache_cat_mla=True)
+        ),
+    )
+
+    with vllm.config.set_current_vllm_config(vllm_config):
+        rotary_emb = RotaryEmbedding(
+            head_size=qk_rope_head_dim,
+            rotary_dim=qk_rope_head_dim,
+            max_position_embeddings=32,
+            base=10000,
+            is_neox_style=True,
+            dtype=dtype,
+        )
+        modules = MLAModules(
+            kv_a_layernorm=IdentityModule(),
+            kv_b_proj=DummyKVProjection(),
+            rotary_emb=rotary_emb,
+            o_proj=OutputProjection(),
+            fused_qkv_a_proj=SplitQKVProjection(
+                q_lora_rank, kv_lora_rank, qk_rope_head_dim
+            ),
+            kv_a_proj_with_mqa=None,
+            q_a_layernorm=IdentityModule(),
+            q_b_proj=TupleLinear(
+                q_lora_rank, num_heads * (qk_nope_head_dim + qk_rope_head_dim)
+            ),
+            q_proj=None,
+            indexer=None,
+            is_sparse=False,
+            topk_indices_buffer=None,
+        )
+        wrapper = MultiHeadLatentAttentionWrapper(
+            hidden_size=q_lora_rank + kv_lora_rank + qk_rope_head_dim,
+            num_heads=num_heads,
+            scale=1.0,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            mla_modules=modules,
+            cache_config=vllm_config.cache_config,
+            prefix="manual_mla",
+        )
+
+    assert vllm.config.get_current_vllm_config_or_none() is None
+
+    dummy = torch.empty(0, dtype=dtype)
+    fused_call: dict[str, torch.Tensor | bool] = {}
+    attn_call: dict[str, torch.Tensor | tuple[int, ...] | None] = {}
+
+    def fake_fused_rope_kv_cache_update(
+        positions: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        is_neox_style: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        fused_call["q_pe"] = q_pe.clone()
+        fused_call["k_pe_shape"] = tuple(k_pe.shape)
+        fused_call["kv_c_normed"] = kv_c_normed
+        fused_call["cos_sin_cache"] = cos_sin_cache
+        fused_call["is_neox_style"] = is_neox_style
+        return dummy, q_pe + 1, k_pe.unsqueeze(1) + 2
+
+    def fake_mla_attn_forward(
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        output_shape: torch.Size | None = None,
+        kv_cache_dummy_dep: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        attn_call["q"] = q.clone()
+        attn_call["kv_c_normed"] = kv_c_normed
+        attn_call["k_pe"] = k_pe
+        attn_call["kv_cache_dummy_dep"] = kv_cache_dummy_dep
+        assert output_shape is not None
+        return torch.empty(output_shape, dtype=q.dtype, device=q.device)
+
+    monkeypatch.setattr(
+        wrapper.mla_attn,
+        "fused_rope_kv_cache_update",
+        fake_fused_rope_kv_cache_update,
+    )
+    monkeypatch.setattr(wrapper.mla_attn, "forward", fake_mla_attn_forward)
+
+    def fail_rotary_forward(*args, **kwargs):
+        raise AssertionError("manual fused path should skip rotary_emb.forward")
+
+    monkeypatch.setattr(wrapper.rotary_emb, "forward", fail_rotary_forward)
+
+    hidden_states = torch.randn(
+        num_tokens,
+        q_lora_rank + kv_lora_rank + qk_rope_head_dim,
+        dtype=dtype,
+    )
+    positions = torch.arange(num_tokens, dtype=torch.long)
+
+    wrapper(positions, hidden_states)
+
+    assert fused_call["k_pe_shape"] == (num_tokens, qk_rope_head_dim)
+    assert fused_call["is_neox_style"] is True
+    assert attn_call["kv_cache_dummy_dep"] is dummy
+    k_pe = attn_call["k_pe"]
+    assert isinstance(k_pe, torch.Tensor)
+    assert k_pe.shape == (num_tokens, 1, qk_rope_head_dim)
+    q = attn_call["q"]
+    assert isinstance(q, torch.Tensor)
+    torch.testing.assert_close(
+        q[..., qk_nope_head_dim:],
+        fused_call["q_pe"] + 1,
+    )
